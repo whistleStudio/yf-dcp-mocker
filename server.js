@@ -1,0 +1,884 @@
+/**
+ * 无人机地面站WebSocket服务端
+ * 根据无人机遥测06091148.doc实现
+ * 3种频率: 3Hz(基础数据), 1Hz(电池感知), 1/30Hz(自检)
+ */
+
+const WebSocket = require('ws');
+const { v4: uuidv4 } = require('uuid');
+
+// 配置
+const CONFIG = {
+  WS_PORT: 8081,
+  AUTH_USERNAME: 'rkws',
+  AUTH_PASSWORD: 'qwer!@#$',
+  DRONE_SN: '1F00223233510B34373435',
+  SOURCE: 'WE0GD95PA1667168259400',
+  // 频率配置
+  FREQ_3HZ: 333,      // 3Hz = 333ms
+  FREQ_1HZ: 1000,     // 1Hz = 1000ms
+  FREQ_1_30HZ: 30000  // 1/30Hz = 30000ms
+};
+
+// 经纬度范围配置（矩形区域）
+const GEO_BOUNDS = {
+  minLng: 118.823655,
+  maxLng: 118.936109,
+  minLat: 31.889001,
+  maxLat: 31.94492
+};
+
+// 模拟无人机状态
+const droneState = {
+  // 基础数据（初始位置设为矩形中心）
+  lat: (GEO_BOUNDS.minLat + GEO_BOUNDS.maxLat) / 2,
+  lng: (GEO_BOUNDS.minLng + GEO_BOUNDS.maxLng) / 2,
+  alt: 100, // 海拔高度 = 起飞点海拔(~75m) + 相对高度
+  relativeHeight: 25,
+  trueGroundHeight: 25, // 对地真高（与相对高度接近）
+  groundSpeed: 10, // 5-20 m/s
+  verticalSpeed: 0,
+  totalSpeed: 10,
+  heading: 180,
+  yaw: 180,
+  pitch: 0,
+  roll: 0,
+
+  // 移动方向（用于计算经纬度变化）
+  latDirection: 0,
+  lngDirection: 0,
+
+  // 速度控制目标（连续变化）
+  targetGroundSpeed: 10,
+  targetRelativeHeight: 25,
+
+  // 起飞点海拔高度（用于计算绝对海拔）
+  homeAlt: 75,
+
+  // 飞行状态
+  remainingFlightTime: 45,
+  landedState: 1, // 0-着陆，1-空中，2-正在着陆，3-正在起飞
+  modeNum: 2,
+  lock: true,
+  currentWaypointSeq: 3,
+
+  // 感知数据
+  obstacleAvoidance: true,
+  terrainFollowing: true,
+  visionLanding: true,
+  targetHeight: 50,
+
+  // 电池
+  battery1_soc: 87,
+  battery2_soc: 87,
+  battery1_soh: 95,
+  battery2_soh: 95,
+  battery1_cycle: 150,
+  battery2_cycle: 150,
+  battery1_capacity: 50,
+  battery2_capacity: 50,
+  battery1_total_voltage: 30,
+  battery2_total_voltage: 30,
+
+  // 任务信息
+  currentBid: null,
+  currentTid: null
+};
+
+// 飞控板类型
+const SERIAL_NUMBER = '1581F6M1234567';
+const FIRMWARE_VERSION = 'v01.02.03';
+
+/**
+ * 更新无人机位置（在矩形范围内连续随机移动）
+ * 速度控制在 5-20 m/s，相对高度控制在 5-60 m
+ */
+function updateDronePosition() {
+  // ========== 速度控制 (5-20 m/s) ==========
+  // 目标速度缓慢漂移
+  droneState.targetGroundSpeed += (Math.random() - 0.5) * 1.0;
+  droneState.targetGroundSpeed = Math.max(5, Math.min(20, droneState.targetGroundSpeed));
+
+  // 实际速度平滑趋近目标速度
+  droneState.groundSpeed += (droneState.targetGroundSpeed - droneState.groundSpeed) * 0.1;
+  droneState.groundSpeed = Math.max(5, Math.min(20, droneState.groundSpeed));
+
+  // ========== 高度控制 (5-60 m) ==========
+  // 目标高度缓慢漂移
+  droneState.targetRelativeHeight += (Math.random() - 0.5) * 2.0;
+  droneState.targetRelativeHeight = Math.max(5, Math.min(60, droneState.targetRelativeHeight));
+
+  // 实际高度平滑趋近目标高度
+  const heightDiff = droneState.targetRelativeHeight - droneState.relativeHeight;
+  droneState.verticalSpeed = heightDiff * 0.05; // 垂直速度由高度差决定
+  droneState.verticalSpeed = Math.max(-2, Math.min(2, droneState.verticalSpeed)); // 限制垂直速度 ±2 m/s
+  droneState.relativeHeight += droneState.verticalSpeed;
+
+  // 海拔高度 = 起飞点海拔 + 相对高度
+  droneState.alt = droneState.homeAlt + droneState.relativeHeight;
+
+  // 对地真高（模拟地形变化，与相对高度有小偏差）
+  droneState.trueGroundHeight = droneState.relativeHeight + (Math.random() - 0.5) * 2;
+  droneState.trueGroundHeight = Math.max(0, droneState.trueGroundHeight);
+
+  // ========== 航向控制（缓慢转向）==========
+  droneState.heading += (Math.random() - 0.5) * 5;
+  if (droneState.heading < 0) droneState.heading += 360;
+  if (droneState.heading >= 360) droneState.heading -= 360;
+
+  // 偏航角跟随航向
+  droneState.yaw = droneState.heading > 180 ? droneState.heading - 360 : droneState.heading;
+
+  // ========== 俯仰和横滚（与运动相关）==========
+  // 速度变化时产生俯仰角
+  droneState.pitch = (droneState.targetGroundSpeed - droneState.groundSpeed) * 0.5 + (Math.random() - 0.5) * 2;
+  droneState.pitch = Math.max(-10, Math.min(10, droneState.pitch));
+
+  // 转向时产生横滚角
+  droneState.roll = (Math.random() - 0.5) * 4;
+  droneState.roll = Math.max(-10, Math.min(10, droneState.roll));
+
+  // ========== 计算经纬度变化 ==========
+  // 根据航向和速度计算方向向量
+  const headingRad = droneState.heading * Math.PI / 180;
+  const speedPerUpdate = droneState.groundSpeed * 0.333 / 111000; // 3Hz更新，转换为度
+
+  // 纬度变化（北向分量）
+  droneState.latDirection = Math.cos(headingRad) * speedPerUpdate;
+  // 经度变化（东向分量，需要除以cos纬度修正）
+  droneState.lngDirection = Math.sin(headingRad) * speedPerUpdate / Math.cos(droneState.lat * Math.PI / 180);
+
+  // 更新位置
+  droneState.lat += droneState.latDirection;
+  droneState.lng += droneState.lngDirection;
+
+  // ========== 边界检测和转向 ==========
+  if (droneState.lat < GEO_BOUNDS.minLat || droneState.lat > GEO_BOUNDS.maxLat) {
+    // 纬度边界：反转南北分量
+    droneState.heading = 360 - droneState.heading;
+    droneState.lat = Math.max(GEO_BOUNDS.minLat, Math.min(GEO_BOUNDS.maxLat, droneState.lat));
+  }
+  if (droneState.lng < GEO_BOUNDS.minLng || droneState.lng > GEO_BOUNDS.maxLng) {
+    // 经度边界：反转东西分量
+    droneState.heading = 180 - droneState.heading;
+    if (droneState.heading < 0) droneState.heading += 360;
+    if (droneState.heading >= 360) droneState.heading -= 360;
+    droneState.lng = Math.max(GEO_BOUNDS.minLng, Math.min(GEO_BOUNDS.maxLng, droneState.lng));
+  }
+
+  // ========== 合速度 ==========
+  droneState.totalSpeed = Math.sqrt(
+    Math.pow(droneState.groundSpeed, 2) +
+    Math.pow(droneState.verticalSpeed, 2)
+  );
+
+  // ========== 剩余飞行时间估算 ==========
+  droneState.remainingFlightTime = Math.max(0, droneState.remainingFlightTime - 0.005);
+}
+
+/**
+ * 生成公共消息头
+ */
+function createMessageHeader(method) {
+  return {
+    action: 'telemetry',
+    source: CONFIG.SOURCE,
+    sn: CONFIG.DRONE_SN,
+    tid: uuidv4(),
+    bid: droneState.currentBid || uuidv4(),
+    method,
+    timestamp: Date.now()
+  };
+}
+
+/**
+ * 3Hz数据: 基础数据 + 飞行状态
+ */
+function generate3HzData() {
+  updateDronePosition();
+
+  return {
+    ...createMessageHeader('realtimeData'),
+    basic_data: {
+      lat: parseFloat(droneState.lat.toFixed(6)),
+      lng: parseFloat(droneState.lng.toFixed(6)),
+      alt: parseFloat(droneState.alt.toFixed(1)),
+      relative_height: parseFloat(droneState.relativeHeight.toFixed(1)),
+      true_ground_height: parseFloat(droneState.trueGroundHeight.toFixed(1)),
+      ground_speed: parseFloat(droneState.groundSpeed.toFixed(1)),
+      vertical_speed: parseFloat(droneState.verticalSpeed.toFixed(2)),
+      total_speed: parseFloat(droneState.totalSpeed.toFixed(1)),
+      heading: parseFloat(droneState.heading.toFixed(1)),
+      yaw: parseFloat(droneState.yaw.toFixed(1)),
+      pitch: parseFloat(droneState.pitch.toFixed(1)),
+      roll: parseFloat(droneState.roll.toFixed(1))
+    },
+    flight_status: {
+      remaining_flight_time: parseFloat(droneState.remainingFlightTime.toFixed(1)),
+      landed_state: droneState.landedState,
+      mode_num: droneState.modeNum,
+      lock: droneState.lock,
+      serial_number: SERIAL_NUMBER,
+      firmware_version: FIRMWARE_VERSION,
+      current_waypoint_seq: droneState.currentWaypointSeq
+    }
+  };
+}
+
+/**
+ * 1Hz数据: 电池、感知数据
+ */
+function generate1HzData() {
+  return {
+    ...createMessageHeader('realtimeData'),
+    perception: {
+      obstacle_avoidance: {
+        enabled: droneState.obstacleAvoidance,
+        obstacles: [
+          { direction: 'front', distance: parseFloat((5.2 + Math.random() * 3).toFixed(1)) },
+          { direction: 'left_front', distance: parseFloat((4.8 + Math.random() * 3).toFixed(1)) },
+          { direction: 'right_front', distance: parseFloat((4.5 + Math.random() * 3).toFixed(1)) },
+          { direction: 'left', distance: parseFloat((3.8 + Math.random() * 3).toFixed(1)) },
+          { direction: 'right', distance: parseFloat((4.2 + Math.random() * 3).toFixed(1)) },
+          { direction: 'back', distance: parseFloat((6.5 + Math.random() * 3).toFixed(1)) }
+        ]
+      },
+      terrain_following: {
+        enabled: droneState.terrainFollowing,
+        target_height: droneState.targetRelativeHeight,
+        current_height: parseFloat(droneState.relativeHeight.toFixed(1))
+      },
+      vision_landing: {
+        enabled: droneState.visionLanding,
+        qr_code_detected: false
+      },
+      sbus_joystick: {
+        throttle: 0,
+        yaw: 0,
+        pitch: 0,
+        roll: 0
+      },
+      front_mmwave_radar: {
+        distance: parseFloat((15.3 + Math.random() * 5).toFixed(1))
+      },
+      downward_mmwave_radar: {
+        height: parseFloat(droneState.trueGroundHeight.toFixed(1))
+      }
+    },
+    position_attitude: {
+      satellite_count: 16,
+      gps_signal_level: 4,
+      cros_connected: false,
+      true_ground_height: parseFloat(droneState.trueGroundHeight.toFixed(1)),
+      remote_position: {
+        lat: parseFloat((droneState.lat + 0.0001).toFixed(6)),
+        lng: parseFloat((droneState.lng + 0.0001).toFixed(6)),
+        alt: droneState.alt
+      }
+    },
+    communication: {
+      video_transmission: {
+        node_type: 'master',
+        snr: parseFloat((28.5 + Math.random() * 5).toFixed(1)),
+        rsrp: parseFloat((-75.2 + Math.random() * 10).toFixed(1)),
+        frequency: 5800,
+        encryption_key: ''
+      },
+      cellular_5g: {
+        active_sim: 1,
+        signal_strength: Math.round(-65 + Math.random() * 10)
+      }
+    },
+    avionics: {
+      temperatures: {
+        chip_a: parseFloat((65.5 + Math.random() * 5).toFixed(1)),
+        chip_b: parseFloat((58.2 + Math.random() * 5).toFixed(1)),
+        chip_c: parseFloat((62.3 + Math.random() * 5).toFixed(1))
+      },
+      humidity: 65.8,
+      cpu_usage: parseFloat((45.2 + Math.random() * 10).toFixed(1)),
+      emmc_usage: 68.5,
+      ssd_usage: 32,
+      motors: [
+        { id: 1, speed: Math.round(5200 + Math.random() * 200), voltage: 24.5, current: parseFloat((12.5 + Math.random() * 2).toFixed(1)), temperature: parseFloat((52.3 + Math.random() * 5).toFixed(1)) },
+        { id: 2, speed: Math.round(5180 + Math.random() * 200), voltage: 24.5, current: parseFloat((12.3 + Math.random() * 2).toFixed(1)), temperature: parseFloat((51.8 + Math.random() * 5).toFixed(1)) },
+        { id: 3, speed: Math.round(5210 + Math.random() * 200), voltage: 24.5, current: parseFloat((12.6 + Math.random() * 2).toFixed(1)), temperature: parseFloat((52.5 + Math.random() * 5).toFixed(1)) },
+        { id: 4, speed: Math.round(5190 + Math.random() * 200), voltage: 24.5, current: parseFloat((12.4 + Math.random() * 2).toFixed(1)), temperature: parseFloat((52 + Math.random() * 5).toFixed(1)) }
+      ],
+      total_power: 1250.5
+    },
+    battery_system: {
+      battery1: {
+        sn: '12345678',
+        current: parseFloat((12.5 + Math.random() * 2).toFixed(1)),
+        hardware_version: '1.0',
+        software_version: '1.0',
+        capacity: droneState.battery1_capacity,
+        total_voltage: droneState.battery1_total_voltage,
+        cell_voltages: [3.2, 3.3, 3.4, 3.5, 3.6, 3.7, 3.8, 3.9, 4, 4.1, 4.2, 4.3],
+        soc: droneState.battery1_soc,
+        soh: droneState.battery1_soh,
+        cycle: droneState.battery1_cycle,
+        temperatures: { mos: 45.2, cell: 38.5, connector: 42.3 },
+        state: { ready: true, discharge: false, charge: true },
+        protections: {
+          over_voltage: false, under_voltage: false, over_temp: false,
+          under_temp: false, charge_over_current: false, discharge_over_current: true, short_circuit: false
+        },
+        discharge_day: 30,
+        ready_flag: true
+      },
+      battery2: {
+        sn: '12345678',
+        current: parseFloat((12.5 + Math.random() * 2).toFixed(1)),
+        hardware_version: '1.0',
+        software_version: '1.0',
+        capacity: droneState.battery2_capacity,
+        total_voltage: droneState.battery2_total_voltage,
+        cell_voltages: [3.2, 3.3, 3.4, 3.5, 3.6, 3.7, 3.8, 3.9, 4, 4.1, 4.2, 4.3],
+        soc: droneState.battery2_soc,
+        soh: droneState.battery2_soh,
+        cycle: droneState.battery2_cycle,
+        temperatures: { mos: 44.8, cell: 37.9, connector: 41.5 },
+        state: { ready: true, discharge: true, charge: false },
+        protections: {
+          over_voltage: false, under_voltage: false, over_temp: false,
+          under_temp: false, charge_over_current: false, discharge_over_current: false, short_circuit: false
+        },
+        discharge_day: 28,
+        ready_flag: true
+      }
+    },
+    power_modules: {
+      local_voltage: 24.5,
+      load_current: -3.2,
+      fan_speed: 1500,
+      ladar_power: true,
+      ld0_power: true,
+      ld1_power: false,
+      switch_power: true,
+      typec_high_power: true,
+      typec_low_power: false,
+      rk3588_power: true,
+      typec1_high_power: true,
+      typec1_low_power: false,
+      typec2_high_power: true,
+      typec2_low_power: false,
+      view_5v_power: true,
+      view_12v_power: true,
+      fc_power: true,
+      fan_power: true,
+      down_led_power: true,
+      down_led_state: true
+    },
+    network_status: {
+      load_ip: '192.168.1.100',
+      load1_ip: '192.168.1.101',
+      load2_ip: '192.168.1.102'
+    },
+    hall_sensors: {
+      hall1_state: false,
+      hall2_state: true
+    }
+  };
+}
+
+/**
+ * 1/30Hz数据: 飞行器自检
+ */
+function generateSelfCheckData() {
+  return {
+    ...createMessageHeader('selfCheckData'),
+    self_check: {
+      overall: 'caution',
+      items: {
+        power_system: '0',
+        avionics_system: '1',
+        perception_system: '0',
+        log_management: '0',
+        battery_system: '0',
+        remote_controller: '0',
+        video_transmission: '0',
+        registration_info: '2'
+      }
+    }
+  };
+}
+
+// WebSocket服务器
+const wss = new WebSocket.Server({ port: CONFIG.WS_PORT });
+
+// 已认证的客户端
+const authenticatedClients = new Set();
+
+// 定时器
+let timer3Hz = null;
+let timer1Hz = null;
+let timerSelfCheck = null;
+
+console.log(`无人机地面站WebSocket服务端启动`);
+console.log(`监听端口: ${CONFIG.WS_PORT}`);
+console.log(`认证用户名: ${CONFIG.AUTH_USERNAME}`);
+console.log(`认证密码: ${CONFIG.AUTH_PASSWORD}`);
+console.log(`数据频率: 3Hz(基础), 1Hz(感知), 1/30Hz(自检)`);
+
+wss.on('connection', (ws) => {
+  console.log('新客户端连接');
+
+  ws.isAuthenticated = false;
+
+  ws.on('message', (data) => {
+    try {
+      const message = JSON.parse(data);
+      console.log('收到消息:', JSON.stringify(message, null, 2));
+
+      // 处理认证请求
+      if (message.action === 'auth') {
+        handleAuth(ws, message);
+      }
+      // 处理验签请求
+      else if (message.action === 'verify') {
+        handleVerify(ws, message);
+      }
+      // 处理命令请求
+      else if (message.action === 'command' && message.method) {
+        handleCommand(ws, message);
+      }
+    } catch (error) {
+      console.error('消息处理错误:', error);
+    }
+  });
+
+  ws.on('close', () => {
+    console.log('客户端断开连接');
+    authenticatedClients.delete(ws);
+    if (authenticatedClients.size === 0) {
+      stopTelemetry();
+    }
+  });
+
+  ws.on('error', (error) => {
+    console.error('WebSocket错误:', error);
+  });
+});
+
+/**
+ * 处理认证请求
+ */
+function handleAuth(ws, message) {
+  const { source, username, password } = message;
+
+  if (username === CONFIG.AUTH_USERNAME && password === CONFIG.AUTH_PASSWORD) {
+    ws.isAuthenticated = true;
+    ws.source = source;
+
+    const response = {
+      action: 'auth',
+      source,
+      result: 'success'
+    };
+
+    ws.send(JSON.stringify(response));
+    console.log('认证成功:', source);
+
+    // 添加到已认证客户端
+    authenticatedClients.add(ws);
+
+    // 如果是第一个认证客户端，开始发送遥测数据
+    if (authenticatedClients.size === 1) {
+      startTelemetry();
+    }
+  } else {
+    const response = {
+      action: 'auth',
+      source,
+      result: 'fail',
+      reason: '用户名或密码错误'
+    };
+
+    ws.send(JSON.stringify(response));
+    console.log('认证失败:', source);
+  }
+}
+
+/**
+ * 处理验签请求
+ */
+function handleVerify(ws, message) {
+  const { source, cert } = message;
+
+  // Mock验签逻辑：只要提供了证书就验证通过
+  if (cert && cert.includes('BEGIN CERTIFICATE')) {
+    const response = {
+      action: 'verify',
+      source,
+      result: 'success'
+    };
+
+    ws.send(JSON.stringify(response));
+    console.log('验签成功:', source);
+  } else {
+    const response = {
+      action: 'verify',
+      source,
+      result: 'fail',
+      reason: '证书格式错误或无效'
+    };
+
+    ws.send(JSON.stringify(response));
+    console.log('验签失败:', source);
+  }
+}
+
+/**
+ * 处理命令请求
+ */
+function handleCommand(ws, message) {
+  const { tid, bid, method, data } = message;
+
+  droneState.currentBid = bid;
+  droneState.currentTid = tid;
+
+  console.log(`收到命令: ${method}, tid: ${tid}, bid: ${bid}`);
+
+  switch (method) {
+    case 'unlock':
+      handleUnlock(ws, tid, bid);
+      break;
+    case 'lock':
+      handleLock(ws, tid, bid);
+      break;
+    case 'takeOff':
+      handleTakeOff(ws, tid, bid, data);
+      break;
+    case 'backHome':
+      handleBackHome(ws, tid, bid);
+      break;
+    case 'land':
+      handleLand(ws, tid, bid, data);
+      break;
+    case 'stop':
+      handleStop(ws, tid, bid);
+      break;
+    case 'pointFly':
+      handlePointFly(ws, tid, bid, data);
+      break;
+    case 'droneControl':
+      handleDroneControl(ws, tid, bid, data);
+      break;
+    case 'airplaneMode':
+      handleAirplaneMode(ws, tid, bid, data);
+      break;
+    case 'routeFly':
+      handleRouteFly(ws, tid, bid, data);
+      break;
+    case 'continueFly':
+      handleContinueFly(ws, tid, bid);
+      break;
+    case 'waypointJump':
+      handleWaypointJump(ws, tid, bid, data);
+      break;
+    case 'smartFlight':
+      handleSmartFlight(ws, tid, bid, data);
+      break;
+    default:
+      console.log(`未知命令: ${method}`);
+      sendCommandReply(ws, tid, bid, method, -1, `未知命令: ${method}`);
+  }
+}
+
+/**
+ * 发送命令回复
+ */
+function sendCommandReply(ws, tid, bid, method, result = 0, message = '执行成功') {
+  const reply = {
+    action: 'command_reply',
+    source: CONFIG.SOURCE,
+    sn: CONFIG.DRONE_SN,
+    tid,
+    bid,
+    method,
+    timestamp: Date.now(),
+    data: {
+      result,
+      message
+    }
+  };
+  ws.send(JSON.stringify(reply));
+}
+
+/**
+ * 解锁命令
+ */
+function handleUnlock(ws, tid, bid) {
+  droneState.lock = false;
+  console.log('无人机解锁');
+  sendCommandReply(ws, tid, bid, 'unlock', 0, '解锁成功');
+}
+
+/**
+ * 上锁命令
+ */
+function handleLock(ws, tid, bid) {
+  droneState.lock = true;
+  console.log('无人机上锁');
+  sendCommandReply(ws, tid, bid, 'lock', 0, '上锁成功');
+}
+
+/**
+ * 起飞命令
+ */
+function handleTakeOff(ws, tid, bid, data) {
+  const targetHeight = data?.height || 10;
+  console.log(`无人机起飞，目标高度: ${targetHeight}m`);
+
+  droneState.landedState = 3; // 正在起飞
+  droneState.lock = false;
+
+  // 模拟起飞过程
+  const takeOffInterval = setInterval(() => {
+    if (droneState.relativeHeight < targetHeight) {
+      droneState.relativeHeight += 0.5;
+      droneState.verticalSpeed = 0.5;
+      droneState.alt += 0.5;
+    } else {
+      droneState.landedState = 1; // 空中
+      droneState.verticalSpeed = 0;
+      clearInterval(takeOffInterval);
+      console.log('起飞完成');
+    }
+  }, 100);
+
+  sendCommandReply(ws, tid, bid, 'takeOff', 0, '起飞命令已接收');
+}
+
+/**
+ * 返航命令
+ */
+function handleBackHome(ws, tid, bid) {
+  console.log('无人机返航');
+  droneState.modeNum = 4;
+  droneState.landedState = 1;
+  sendCommandReply(ws, tid, bid, 'backHome', 0, '返航命令已接收');
+}
+
+/**
+ * 降落命令
+ */
+function handleLand(ws, tid, bid, data) {
+  const landHeight = data?.landHeight || 0;
+  console.log(`无人机降落，目标高度: ${landHeight}m`);
+
+  droneState.landedState = 2; // 正在着陆
+
+  // 模拟降落过程
+  const landInterval = setInterval(() => {
+    if (droneState.relativeHeight > landHeight) {
+      droneState.relativeHeight -= 0.5;
+      droneState.verticalSpeed = -0.5;
+      droneState.alt -= 0.5;
+    } else {
+      droneState.landedState = 0; // 着陆
+      droneState.verticalSpeed = 0;
+      droneState.relativeHeight = landHeight;
+      clearInterval(landInterval);
+      console.log('降落完成');
+    }
+  }, 100);
+
+  sendCommandReply(ws, tid, bid, 'land', 0, '降落命令已接收');
+}
+
+/**
+ * 悬停命令
+ */
+function handleStop(ws, tid, bid) {
+  console.log('无人机悬停');
+  droneState.groundSpeed = 0;
+  droneState.verticalSpeed = 0;
+  droneState.totalSpeed = 0;
+  droneState.latDirection = 0;
+  droneState.lngDirection = 0;
+  sendCommandReply(ws, tid, bid, 'stop', 0, '悬停命令已接收');
+}
+
+/**
+ * 点指飞行命令
+ */
+function handlePointFly(ws, tid, bid, data) {
+  const { longitude, latitude, height } = data;
+  console.log(`指点飞行: 经度=${longitude}, 纬度=${latitude}, 高度=${height}m`);
+
+  const targetLat = parseFloat(latitude);
+  const targetLng = parseFloat(longitude);
+  const targetHeight = height;
+
+  const moveInterval = setInterval(() => {
+    const latDiff = targetLat - droneState.lat;
+    const lngDiff = targetLng - droneState.lng;
+    const heightDiff = targetHeight - droneState.relativeHeight;
+
+    if (Math.abs(latDiff) > 0.00001 || Math.abs(lngDiff) > 0.00001 || Math.abs(heightDiff) > 0.5) {
+      droneState.lat += latDiff * 0.01;
+      droneState.lng += lngDiff * 0.01;
+      droneState.relativeHeight += heightDiff * 0.01;
+      droneState.alt += heightDiff * 0.01;
+      droneState.groundSpeed = 5;
+      droneState.verticalSpeed = heightDiff > 0 ? 0.5 : -0.5;
+      droneState.totalSpeed = Math.sqrt(Math.pow(droneState.groundSpeed, 2) + Math.pow(droneState.verticalSpeed, 2));
+      droneState.heading = Math.atan2(lngDiff, latDiff) * 180 / Math.PI;
+    } else {
+      droneState.lat = targetLat;
+      droneState.lng = targetLng;
+      droneState.relativeHeight = targetHeight;
+      droneState.groundSpeed = 0;
+      droneState.verticalSpeed = 0;
+      droneState.totalSpeed = 0;
+      clearInterval(moveInterval);
+      console.log('到达目标点');
+    }
+  }, 100);
+
+  sendCommandReply(ws, tid, bid, 'pointFly', 0, '指点飞行命令已接收');
+}
+
+/**
+ * 手动控制命令
+ */
+function handleDroneControl(ws, tid, bid, data) {
+  const { x, y, h, w } = data;
+  console.log(`手动控制: x=${x}, y=${y}, h=${h}, w=${w}`);
+
+  droneState.groundSpeed = Math.sqrt(Math.pow(x, 2) + Math.pow(y, 2));
+  droneState.verticalSpeed = h;
+  droneState.totalSpeed = Math.sqrt(Math.pow(x, 2) + Math.pow(y, 2) + Math.pow(h, 2));
+  droneState.heading = (droneState.heading + w) % 360;
+
+  sendCommandReply(ws, tid, bid, 'droneControl', 0, '手动控制命令已接收');
+}
+
+/**
+ * 设置飞行模式命令
+ */
+function handleAirplaneMode(ws, tid, bid, data) {
+  const { modeCode } = data;
+  const modeNames = {
+    1: 'Offboard模式',
+    2: '定点模式',
+    3: '自动任务模式',
+    4: '自动返航模式',
+    5: '定高模式'
+  };
+
+  droneState.modeNum = modeCode;
+
+  console.log(`飞行模式切换为: ${modeNames[modeCode] || modeCode}`);
+  sendCommandReply(ws, tid, bid, 'airplaneMode', 0, `飞行模式已切换为${modeNames[modeCode] || modeCode}`);
+}
+
+/**
+ * 航线飞行命令
+ */
+function handleRouteFly(ws, tid, bid, data) {
+  const { plan } = data;
+  console.log(`航线飞行: ${plan}`);
+
+  droneState.modeNum = 3;
+  droneState.currentWaypointSeq = 1;
+
+  sendCommandReply(ws, tid, bid, 'routeFly', 0, '航线飞行命令已接收');
+}
+
+/**
+ * 断点续飞命令
+ */
+function handleContinueFly(ws, tid, bid) {
+  console.log('断点续飞');
+  droneState.modeNum = 3;
+  sendCommandReply(ws, tid, bid, 'continueFly', 0, '断点续飞命令已接收');
+}
+
+/**
+ * 航点跳转命令
+ */
+function handleWaypointJump(ws, tid, bid, data) {
+  const { targetSeq } = data;
+  console.log(`航点跳转到: ${targetSeq}`);
+  droneState.currentWaypointSeq = targetSeq;
+  sendCommandReply(ws, tid, bid, 'waypointJump', 0, `已跳转到航点${targetSeq}`);
+}
+
+/**
+ * 智能飞行命令
+ */
+function handleSmartFlight(ws, tid, bid, data) {
+  const { enabled } = data;
+  console.log(`智能飞行: ${enabled ? '进入' : '退出'}`);
+
+  droneState.obstacleAvoidance = enabled === 1;
+  droneState.terrainFollowing = enabled === 1;
+  droneState.visionLanding = enabled === 1;
+
+  sendCommandReply(ws, tid, bid, 'smartFlight', 0, enabled ? '已进入智能飞行模式' : '已退出智能飞行模式');
+}
+
+/**
+ * 开始发送遥测数据
+ */
+function startTelemetry() {
+  console.log('开始发送遥测数据');
+
+  // 3Hz: 基础数据 + 飞行状态
+  timer3Hz = setInterval(() => {
+    const data = generate3HzData();
+    broadcastToClients(data);
+  }, CONFIG.FREQ_3HZ);
+
+  // 1Hz: 电池、感知数据
+  timer1Hz = setInterval(() => {
+    const data = generate1HzData();
+    broadcastToClients(data);
+  }, CONFIG.FREQ_1HZ);
+
+  // 1/30Hz: 飞行器自检
+  timerSelfCheck = setInterval(() => {
+    const data = generateSelfCheckData();
+    broadcastToClients(data);
+  }, CONFIG.FREQ_1_30HZ);
+}
+
+/**
+ * 停止发送遥测数据
+ */
+function stopTelemetry() {
+  console.log('停止发送遥测数据');
+  if (timer3Hz) { clearInterval(timer3Hz); timer3Hz = null; }
+  if (timer1Hz) { clearInterval(timer1Hz); timer1Hz = null; }
+  if (timerSelfCheck) { clearInterval(timerSelfCheck); timerSelfCheck = null; }
+}
+
+/**
+ * 广播消息给所有已认证客户端
+ */
+function broadcastToClients(data) {
+  authenticatedClients.forEach((client) => {
+    if (client.readyState === WebSocket.OPEN && client.isAuthenticated) {
+      client.send(JSON.stringify(data));
+    }
+  });
+}
+
+// 优雅关闭
+process.on('SIGINT', () => {
+  console.log('服务端关闭');
+  stopTelemetry();
+  wss.close();
+  process.exit(0);
+});
+
+process.on('SIGTERM', () => {
+  console.log('服务端关闭');
+  stopTelemetry();
+  wss.close();
+  process.exit(0);
+});
