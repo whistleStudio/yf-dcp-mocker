@@ -6,6 +6,9 @@
 
 const WebSocket = require('ws');
 const { v4: uuidv4 } = require('uuid');
+const SimpleFtpServer = require('./ftp-server');
+const path = require('path');
+const fs = require('fs');
 
 // 配置
 const CONFIG = {
@@ -17,7 +20,12 @@ const CONFIG = {
   // 频率配置
   FREQ_3HZ: 333,      // 3Hz = 333ms
   FREQ_1HZ: 1000,     // 1Hz = 1000ms
-  FREQ_1_30HZ: 30000  // 1/30Hz = 30000ms
+  FREQ_1_30HZ: 30000, // 1/30Hz = 30000ms
+  // FTP配置
+  FTP_PORT: 21,
+  FTP_USERNAME: 'firefly',
+  FTP_PASSWORD: 'firefly',
+  FTP_ROOT: path.join(__dirname, 'ftp-data') // FTP根目录
 };
 
 // 经纬度范围配置（矩形区域）
@@ -141,30 +149,65 @@ function updateDronePosition() {
   // ========== 计算经纬度变化 ==========
   // 根据航向和速度计算方向向量
   const headingRad = droneState.heading * Math.PI / 180;
-  const speedPerUpdate = droneState.groundSpeed * 0.333 / 111000; // 3Hz更新，转换为度
+  // 放大步长系数（原值约0.000003，放大到0.00003，加快移动速度）
+  const speedFactor = 0.00003;
 
   // 纬度变化（北向分量）
-  droneState.latDirection = Math.cos(headingRad) * speedPerUpdate;
+  droneState.latDirection = Math.cos(headingRad) * droneState.groundSpeed * speedFactor;
   // 经度变化（东向分量，需要除以cos纬度修正）
-  droneState.lngDirection = Math.sin(headingRad) * speedPerUpdate / Math.cos(droneState.lat * Math.PI / 180);
+  droneState.lngDirection = Math.sin(headingRad) * droneState.groundSpeed * speedFactor / Math.cos(droneState.lat * Math.PI / 180);
 
   // 更新位置
   droneState.lat += droneState.latDirection;
   droneState.lng += droneState.lngDirection;
 
-  // ========== 边界检测和转向 ==========
-  if (droneState.lat < GEO_BOUNDS.minLat || droneState.lat > GEO_BOUNDS.maxLat) {
-    // 纬度边界：反转南北分量
-    droneState.heading = 360 - droneState.heading;
-    droneState.lat = Math.max(GEO_BOUNDS.minLat, Math.min(GEO_BOUNDS.maxLat, droneState.lat));
+  // ========== 边界检测和随机转向 ==========
+  // 安全边距（约50米，约0.00045度）
+  const safeMargin = 0.00045;
+
+  // 检测是否接近边界
+  const nearLatMin = droneState.lat < GEO_BOUNDS.minLat + safeMargin;
+  const nearLatMax = droneState.lat > GEO_BOUNDS.maxLat - safeMargin;
+  const nearLngMin = droneState.lng < GEO_BOUNDS.minLng + safeMargin;
+  const nearLngMax = droneState.lng > GEO_BOUNDS.maxLng - safeMargin;
+
+  // 接近边界时随机换向
+  if (nearLatMin || nearLatMax || nearLngMin || nearLngMax) {
+    let newHeading;
+
+    // 根据接近的边界确定安全方向范围
+    if (nearLatMin && nearLngMin) {
+      // 左下角：转向东北方向 (0-90度)
+      newHeading = Math.random() * 90;
+    } else if (nearLatMin && nearLngMax) {
+      // 右下角：转向西北方向 (270-360度)
+      newHeading = 270 + Math.random() * 90;
+    } else if (nearLatMax && nearLngMin) {
+      // 左上角：转向东南方向 (90-180度)
+      newHeading = 90 + Math.random() * 90;
+    } else if (nearLatMax && nearLngMax) {
+      // 右上角：转向西南方向 (180-270度)
+      newHeading = 180 + Math.random() * 90;
+    } else if (nearLatMin) {
+      // 接近南边界：转向北方 (315-45度，跨越0度)
+      newHeading = Math.random() < 0.5 ? Math.random() * 45 : 315 + Math.random() * 45;
+    } else if (nearLatMax) {
+      // 接近北边界：转向南方 (135-225度)
+      newHeading = 135 + Math.random() * 90;
+    } else if (nearLngMin) {
+      // 接近西边界：转向东方 (45-135度)
+      newHeading = 45 + Math.random() * 90;
+    } else if (nearLngMax) {
+      // 接近东边界：转向西方 (225-315度)
+      newHeading = 225 + Math.random() * 90;
+    }
+
+    droneState.heading = newHeading;
   }
-  if (droneState.lng < GEO_BOUNDS.minLng || droneState.lng > GEO_BOUNDS.maxLng) {
-    // 经度边界：反转东西分量
-    droneState.heading = 180 - droneState.heading;
-    if (droneState.heading < 0) droneState.heading += 360;
-    if (droneState.heading >= 360) droneState.heading -= 360;
-    droneState.lng = Math.max(GEO_BOUNDS.minLng, Math.min(GEO_BOUNDS.maxLng, droneState.lng));
-  }
+
+  // 强制边界保护（确保不超出范围）
+  droneState.lat = Math.max(GEO_BOUNDS.minLat, Math.min(GEO_BOUNDS.maxLat, droneState.lat));
+  droneState.lng = Math.max(GEO_BOUNDS.minLng, Math.min(GEO_BOUNDS.maxLng, droneState.lng));
 
   // ========== 合速度 ==========
   droneState.totalSpeed = Math.sqrt(
@@ -421,6 +464,10 @@ console.log(`监听端口: ${CONFIG.WS_PORT}`);
 console.log(`认证用户名: ${CONFIG.AUTH_USERNAME}`);
 console.log(`认证密码: ${CONFIG.AUTH_PASSWORD}`);
 console.log(`数据频率: 3Hz(基础), 1Hz(感知), 1/30Hz(自检)`);
+console.log('---');
+
+// 启动FTP服务
+const ftpServer = startFtpServer();
 
 wss.on('connection', (ws) => {
   console.log('新客户端连接');
@@ -868,11 +915,72 @@ function broadcastToClients(data) {
   });
 }
 
+/**
+ * 启动FTP服务
+ */
+function startFtpServer() {
+  // 创建FTP根目录
+  if (!fs.existsSync(CONFIG.FTP_ROOT)) {
+    fs.mkdirSync(CONFIG.FTP_ROOT, { recursive: true });
+    console.log('创建FTP根目录:', CONFIG.FTP_ROOT);
+  }
+
+  // 创建示例文件
+  const planDir = path.join(CONFIG.FTP_ROOT, 'plan', 'app');
+  if (!fs.existsSync(planDir)) {
+    fs.mkdirSync(planDir, { recursive: true });
+  }
+
+  // 创建示例航线文件
+  const planFile = path.join(planDir, '20260410141629.plan');
+  if (!fs.existsSync(planFile)) {
+    const planData = {
+      fileType: "Plan",
+      version: 1,
+      groundStation: "QGroundControl",
+      geoFence: { version: 2, circles: [], polygons: [] },
+      rallyPoints: { version: 2, points: [] },
+      mission: {
+        cruiseSpeed: 10.0,
+        firmwareType: 12,
+        globalPlanAltitudeMode: 50.0,
+        hoverSpeed: 10.0,
+        version: 2,
+        vehicleType: 2,
+        plannedHomePosition: [31.900297, 118.933955, 50.0],
+        items: [
+          { autoContinue: true, doJumpId: 1, command: 22, frame: 3, type: "SimpleItem", params: [0, 0, 0, 0, 0, 0, 50], altitude: 50 },
+          { autoContinue: true, doJumpId: 2, command: 16, frame: 3, type: "SimpleItem", params: [0, 0, 0, null, 31.900297, 118.933955, 50], altitude: 50 },
+          { autoContinue: true, doJumpId: 3, command: 16, frame: 3, type: "SimpleItem", params: [0, 0, 0, null, 31.90051, 118.934575, 50], altitude: 50 },
+          { autoContinue: true, doJumpId: 4, command: 20, frame: 3, type: "SimpleItem", params: [null, null, null, null, null, null, null], altitude: 0 }
+        ]
+      }
+    };
+    fs.writeFileSync(planFile, JSON.stringify(planData, null, 2));
+    console.log('创建示例航线文件:', planFile);
+  }
+
+  // 使用自定义FTP服务器
+  const ftpServer = new SimpleFtpServer({
+    port: CONFIG.FTP_PORT,
+    root: CONFIG.FTP_ROOT,
+    username: CONFIG.FTP_USERNAME,
+    password: CONFIG.FTP_PASSWORD
+  });
+
+  ftpServer.start();
+
+  return ftpServer;
+}
+
 // 优雅关闭
 process.on('SIGINT', () => {
   console.log('服务端关闭');
   stopTelemetry();
   wss.close();
+  if (ftpServer) {
+    ftpServer.stop();
+  }
   process.exit(0);
 });
 
@@ -880,5 +988,8 @@ process.on('SIGTERM', () => {
   console.log('服务端关闭');
   stopTelemetry();
   wss.close();
+  if (ftpServer) {
+    ftpServer.stop();
+  }
   process.exit(0);
 });
