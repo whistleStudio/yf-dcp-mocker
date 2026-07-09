@@ -790,16 +790,38 @@ function handlePointFly(ws, tid, bid, data) {
 }
 
 /**
- * 手动控制命令
+ * 手动控制命令（offboard模式）
+ * @param {number} data.x - 前进后退方向速度（米/秒），正值前进，负值后退
+ * @param {number} data.y - 左右方向速度（米/秒），正值右移，负值左移
+ * @param {number} data.h - 上下方向速度（米/秒），正值上升，负值下降
+ * @param {number} data.w - 偏航角度增量（弧度），正值顺时针，负值逆时针，范围 -π ~ π
+ * @param {number} data.r - 偏航角速度（弧度/秒），优先级高于w，正值顺时针，负值逆时针，范围 -3.0 ~ 3.0
  */
 function handleDroneControl(ws, tid, bid, data) {
-  const { x, y, h, w } = data;
-  console.log(`手动控制: x=${x}, y=${y}, h=${h}, w=${w}`);
+  const { x, y, h, w, r } = data;
+  console.log(`手动控制: x=${x}, y=${y}, h=${h}, w=${w}rad, r=${r}rad/s`);
 
+  // 更新速度
   droneState.groundSpeed = Math.sqrt(Math.pow(x, 2) + Math.pow(y, 2));
   droneState.verticalSpeed = h;
   droneState.totalSpeed = Math.sqrt(Math.pow(x, 2) + Math.pow(y, 2) + Math.pow(h, 2));
-  droneState.heading = (droneState.heading + w) % 360;
+
+  // 更新偏航角（优先使用角速度r，否则使用角度增量w）
+  if (r !== undefined && r !== null) {
+    // r优先级更高：角速度(rad/s)，假设3Hz更新频率
+    const yawChangeRad = r * 0.333; // 转换为角度增量
+    droneState.heading = (droneState.heading + yawChangeRad * 180 / Math.PI) % 360;
+  } else if (w !== undefined && w !== null) {
+    // w：角度增量(rad)，直接转换为角度
+    droneState.heading = (droneState.heading + w * 180 / Math.PI) % 360;
+  }
+
+  // 确保heading在0-360范围内
+  if (droneState.heading < 0) droneState.heading += 360;
+  if (droneState.heading >= 360) droneState.heading -= 360;
+
+  // 偏航角跟随航向
+  droneState.yaw = droneState.heading > 180 ? droneState.heading - 360 : droneState.heading;
 
   sendCommandReply(ws, tid, bid, 'droneControl', 0, '手动控制命令已接收');
 }
