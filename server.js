@@ -1,7 +1,7 @@
 /**
  * 无人机地面站WebSocket服务端
- * 根据无人机遥测06091148.doc实现
- * 3种频率: 3Hz(基础数据), 1Hz(电池感知), 1/30Hz(自检)
+ * 根据无人机遥测新.doc实现
+ * 3种频率: 1Hz(基础+飞行状态), 1Hz(电池感知), 1/30Hz(自检)
  */
 
 const WebSocket = require('ws');
@@ -65,10 +65,19 @@ const droneState = {
 
   // 飞行状态
   remainingFlightTime: 45,
+  remainingFlightSoc: 87,
+  estimatedReturnTime: 20,
+  estimatedReturnSoc: 94,
   landedState: 1, // 0-着陆，1-空中，2-正在着陆，3-正在起飞
-  modeNum: 2,
+  mode: '定点模式',
   lock: true,
   currentWaypointSeq: 3,
+
+  // 云台角度
+  gimbalPitch: -5.88,
+  gimbalYaw: 1.40,
+  gimbalRoll: -12.21,
+  losPitch: 0,
 
   // 感知数据
   obstacleAvoidance: true,
@@ -215,8 +224,20 @@ function updateDronePosition() {
     Math.pow(droneState.verticalSpeed, 2)
   );
 
+  // ========== 云台角度（缓慢变化）==========
+  droneState.gimbalPitch += (Math.random() - 0.5) * 0.5;
+  droneState.gimbalPitch = Math.max(-90, Math.min(30, droneState.gimbalPitch));
+  droneState.gimbalYaw += (Math.random() - 0.5) * 0.3;
+  droneState.gimbalYaw = Math.max(-180, Math.min(180, droneState.gimbalYaw));
+  droneState.gimbalRoll += (Math.random() - 0.5) * 0.2;
+  droneState.gimbalRoll = Math.max(-30, Math.min(30, droneState.gimbalRoll));
+
   // ========== 剩余飞行时间估算 ==========
   droneState.remainingFlightTime = Math.max(0, droneState.remainingFlightTime - 0.005);
+  // SOC同步减少（按比例：45分钟对应87%，每0.005分钟约减少0.0097%）
+  droneState.remainingFlightSoc = Math.max(0, parseFloat((droneState.remainingFlightSoc - 0.0097).toFixed(1)));
+  droneState.estimatedReturnTime = Math.max(0, droneState.estimatedReturnTime - 0.002);
+  droneState.estimatedReturnSoc = Math.max(0, Math.min(100, droneState.estimatedReturnSoc - 0.005));
 }
 
 /**
@@ -257,9 +278,8 @@ function generate3HzData() {
       roll: parseFloat(droneState.roll.toFixed(1))
     },
     flight_status: {
-      remaining_flight_time: parseFloat(droneState.remainingFlightTime.toFixed(1)),
       landed_state: droneState.landedState,
-      mode_num: droneState.modeNum,
+      mode: droneState.mode,
       lock: droneState.lock,
       serial_number: SERIAL_NUMBER,
       firmware_version: FIRMWARE_VERSION,
@@ -422,6 +442,16 @@ function generate1HzData() {
     hall_sensors: {
       hall1_state: false,
       hall2_state: true
+    },
+    remaining_flight_time: parseFloat(droneState.remainingFlightTime.toFixed(1)),
+    remaining_flight_soc: droneState.remainingFlightSoc,
+    estimated_return_time: droneState.estimatedReturnTime,
+    estimated_return_soc: droneState.estimatedReturnSoc,
+    gimbal_angle: {
+      los_pitch: droneState.losPitch,
+      gimbal_pitch: parseFloat(droneState.gimbalPitch.toFixed(5)),
+      gimbal_yaw: parseFloat(droneState.gimbalYaw.toFixed(5)),
+      gimbal_roll: parseFloat(droneState.gimbalRoll.toFixed(5))
     }
   };
 }
@@ -704,7 +734,7 @@ function handleTakeOff(ws, tid, bid, data) {
  */
 function handleBackHome(ws, tid, bid) {
   console.log('无人机返航');
-  droneState.modeNum = 4;
+  droneState.mode = '自动返航模式';
   droneState.landedState = 1;
   sendCommandReply(ws, tid, bid, 'backHome', 0, '返航命令已接收');
 }
@@ -832,17 +862,24 @@ function handleDroneControl(ws, tid, bid, data) {
 function handleAirplaneMode(ws, tid, bid, data) {
   const { modeCode } = data;
   const modeNames = {
-    1: 'Offboard模式',
+    1: 'offboard模式',
     2: '定点模式',
     3: '自动任务模式',
     4: '自动返航模式',
-    5: '定高模式'
+    5: '定高模式',
+    6: '手动模式',
+    7: '悬停模式',
+    8: '自动降落模式',
+    9: '自动起飞模式',
+    10: '自稳模式',
+    11: '特技模式',
+    12: 'Rattitude模式'
   };
 
-  droneState.modeNum = modeCode;
+  droneState.mode = modeNames[modeCode] || '未知模式';
 
-  console.log(`飞行模式切换为: ${modeNames[modeCode] || modeCode}`);
-  sendCommandReply(ws, tid, bid, 'airplaneMode', 0, `飞行模式已切换为${modeNames[modeCode] || modeCode}`);
+  console.log(`飞行模式切换为: ${droneState.mode}`);
+  sendCommandReply(ws, tid, bid, 'airplaneMode', 0, `飞行模式已切换为${droneState.mode}`);
 }
 
 /**
@@ -852,7 +889,7 @@ function handleRouteFly(ws, tid, bid, data) {
   const { plan } = data;
   console.log(`航线飞行: ${plan}`);
 
-  droneState.modeNum = 3;
+  droneState.mode = '自动任务模式';
   droneState.currentWaypointSeq = 1;
 
   sendCommandReply(ws, tid, bid, 'routeFly', 0, '航线飞行命令已接收');
@@ -863,7 +900,7 @@ function handleRouteFly(ws, tid, bid, data) {
  */
 function handleContinueFly(ws, tid, bid) {
   console.log('断点续飞');
-  droneState.modeNum = 3;
+  droneState.mode = '自动任务模式';
   sendCommandReply(ws, tid, bid, 'continueFly', 0, '断点续飞命令已接收');
 }
 
