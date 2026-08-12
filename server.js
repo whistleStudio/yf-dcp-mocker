@@ -7,6 +7,7 @@
 const WebSocket = require("ws");
 const { v4: uuidv4 } = require("uuid");
 const SimpleFtpServer = require("./ftp-server");
+const SimpleWebDavServer = require("./webdav-server");
 const path = require("path");
 const fs = require("fs");
 
@@ -26,6 +27,12 @@ const CONFIG = {
   FTP_USERNAME: "firefly",
   FTP_PASSWORD: "firefly",
   FTP_ROOT: path.join(__dirname, "ftp-data"), // FTP根目录
+  // WebDAV配置（与 FTP 共用文件根目录）
+  WEBDAV_PORT: 1900,
+  WEBDAV_USERS: {
+    admin: { password: "admin123", readOnly: false },
+    viewer: { password: "viewer123", readOnly: false },
+  },
 };
 
 // 经纬度范围配置（矩形区域）
@@ -35,6 +42,25 @@ const GEO_BOUNDS = {
   minLat: 31.889001,
   maxLat: 31.94492,
 };
+
+/**
+ * 将航向角归一化为 [0, 360)；360 度与 0 度表示同一方向。
+ */
+function normalizeHeading(heading) {
+  const normalizedHeading = heading % 360;
+  return normalizedHeading < 0 ? normalizedHeading + 360 : normalizedHeading;
+}
+
+/**
+ * 同步航向与偏航角，确保 heading 为 0-360，yaw 为 -180 到 180。
+ */
+function setDroneHeading(heading) {
+  droneState.heading = normalizeHeading(heading);
+  droneState.yaw =
+    droneState.heading > 180
+      ? droneState.heading - 360
+      : droneState.heading;
+}
 
 // 模拟无人机状态
 const droneState = {
@@ -158,19 +184,13 @@ function updateDronePosition() {
   droneState.trueGroundHeight = Math.max(0, droneState.trueGroundHeight);
 
   // ========== 航向控制（缓慢转向）==========
-  droneState.heading += (Math.random() - 0.5) * 5;
-  if (droneState.heading < 0) droneState.heading += 360;
-  if (droneState.heading >= 360) droneState.heading -= 360;
-
-  // 偏航角跟随航向
-  droneState.yaw =
-    droneState.heading > 180 ? droneState.heading - 360 : droneState.heading;
+  setDroneHeading(droneState.heading + (Math.random() - 0.5) * 5);
 
   // ========== 俯仰和横滚（与运动相关）==========
   // 速度变化时产生俯仰角
   droneState.pitch =
     (droneState.targetGroundSpeed - droneState.groundSpeed) * 0.5 +
-    (Math.random() - 0.5) * 2;
+    (Math.random() - 0.5) * 20;
   droneState.pitch = Math.max(-10, Math.min(10, droneState.pitch));
 
   // 转向时产生横滚角
@@ -237,7 +257,7 @@ function updateDronePosition() {
       newHeading = 225 + Math.random() * 90;
     }
 
-    droneState.heading = newHeading;
+    setDroneHeading(newHeading);
   }
 
   // 强制边界保护（确保不超出范围）
@@ -609,6 +629,7 @@ console.log("---");
 
 // 启动FTP服务
 const ftpServer = startFtpServer();
+const webDavServer = startWebDavServer();
 
 wss.on("connection", (ws) => {
   console.log("新客户端连接");
@@ -928,7 +949,7 @@ function handlePointFly(ws, tid, bid, data) {
         Math.pow(droneState.groundSpeed, 2) +
           Math.pow(droneState.verticalSpeed, 2),
       );
-      droneState.heading = (Math.atan2(lngDiff, latDiff) * 180) / Math.PI;
+      setDroneHeading((Math.atan2(lngDiff, latDiff) * 180) / Math.PI);
     } else {
       droneState.lat = targetLat;
       droneState.lng = targetLng;
@@ -967,20 +988,15 @@ function handleDroneControl(ws, tid, bid, data) {
   if (r !== undefined && r !== null) {
     // r优先级更高：角速度(rad/s)，假设3Hz更新频率
     const yawChangeRad = r * 0.333; // 转换为角度增量
-    droneState.heading =
-      (droneState.heading + (yawChangeRad * 180) / Math.PI) % 360;
+    setDroneHeading(
+      droneState.heading + (yawChangeRad * 180) / Math.PI,
+    );
   } else if (w !== undefined && w !== null) {
     // w：角度增量(rad)，直接转换为角度
-    droneState.heading = (droneState.heading + (w * 180) / Math.PI) % 360;
+    setDroneHeading(droneState.heading + (w * 180) / Math.PI);
+  } else {
+    setDroneHeading(droneState.heading);
   }
-
-  // 确保heading在0-360范围内
-  if (droneState.heading < 0) droneState.heading += 360;
-  if (droneState.heading >= 360) droneState.heading -= 360;
-
-  // 偏航角跟随航向
-  droneState.yaw =
-    droneState.heading > 180 ? droneState.heading - 360 : droneState.heading;
 
   sendCommandReply(ws, tid, bid, "droneControl", 0, "手动控制命令已接收");
 }
@@ -1216,6 +1232,20 @@ function startFtpServer() {
   return ftpServer;
 }
 
+/**
+ * 启动 WebDAV 服务
+ */
+function startWebDavServer() {
+  const webDavServer = new SimpleWebDavServer({
+    port: CONFIG.WEBDAV_PORT,
+    root: CONFIG.FTP_ROOT,
+    users: CONFIG.WEBDAV_USERS,
+  });
+
+  webDavServer.start();
+  return webDavServer;
+}
+
 // 优雅关闭
 process.on("SIGINT", () => {
   console.log("服务端关闭");
@@ -1223,6 +1253,9 @@ process.on("SIGINT", () => {
   wss.close();
   if (ftpServer) {
     ftpServer.stop();
+  }
+  if (webDavServer) {
+    webDavServer.stop();
   }
   process.exit(0);
 });
@@ -1233,6 +1266,9 @@ process.on("SIGTERM", () => {
   wss.close();
   if (ftpServer) {
     ftpServer.stop();
+  }
+  if (webDavServer) {
+    webDavServer.stop();
   }
   process.exit(0);
 });

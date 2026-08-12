@@ -44,6 +44,8 @@
 - **hall_sensors**: 霍尔传感器状态
 - **flight_status**: 飞行状态
 
+其中 `basic_data` 的角度字段范围如下：`heading` 为 0-360 度（360 度与 0 度等价，实际输出为 `[0, 360)`），`yaw`、`pitch`、`roll` 均为 -180 到 180 度。
+
 ## 安装
 
 ```bash
@@ -61,6 +63,21 @@ npm start
 ```
 
 服务端默认监听端口：`8081`
+
+### 本地 WebDAV 文件服务
+
+启动服务后，同时提供 WebDAV 文件服务：
+
+- 地址：`http://localhost:1900/`
+- 文件根目录：`ftp-data`（与 FTP 服务共用）
+- `admin` / `admin123`：读写权限
+- `viewer` / `viewer123`：读写权限
+
+可在 Windows 文件资源管理器、RaiDrive、Cyberduck 等支持 WebDAV 的客户端中添加上述地址。也可使用 curl 验证：
+
+```bash
+curl -u admin:admin123 -X PROPFIND -H "Depth: 1" http://localhost:1900/
+```
 
 ## 测试
 
@@ -217,6 +234,7 @@ const CONFIG = {
 dcpserver/
 ├── package.json          # 项目配置
 ├── server.js             # WebSocket服务端
+├── webdav-server.js      # 本地 WebDAV 服务
 ├── test-client.js        # 测试客户端
 └── README.md             # 说明文档
 ```
