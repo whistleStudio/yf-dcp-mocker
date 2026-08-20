@@ -6,7 +6,8 @@
   "scripts": {
     "start": "node server.js",
     "dev": "nodemon server.js",
-    "ftp-test": "node ftp-upload.js"
+    "ftp-test": "node ftp-upload.js",
+    "protocol-test": "node protocol-integration-test.js"
   },
   "dependencies": {
     "ws": "^8.16.0",

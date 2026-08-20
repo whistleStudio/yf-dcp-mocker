@@ -21,7 +21,7 @@ console.log('连接地址:', CONFIG.WS_URL);
 const ws = new WebSocket(CONFIG.WS_URL);
 let bid = uuidv4();
 let stats = {
-  total3Hz: 0,
+  total2Hz: 0,
   total1Hz: 0,
   totalSelfCheck: 0,
   startTime: Date.now()
@@ -48,8 +48,14 @@ ws.on('message', (data) => {
 
     // 处理认证响应
     if (message.action === 'auth' && message.result === 'success') {
-      console.log('认证成功，开始接收遥测数据...\n');
-      setTimeout(() => testCommands(), 2000);
+      console.log('认证成功，开始接收遥测数据；发送证书验签请求...\n');
+      sendVerifyRequest();
+      return;
+    }
+
+    if (message.action === 'verify' && message.result === 'success') {
+      console.log('验签成功，开始测试控制命令...\n');
+      setTimeout(() => testCommands(), 500);
       return;
     }
 
@@ -61,11 +67,11 @@ ws.on('message', (data) => {
 
     // 统计遥测数据
     if (message.action === 'telemetry') {
-      // 3Hz数据: basic_data + flight_status
+      // 2Hz数据: basic_data + flight_status
       if (message.basic_data && message.flight_status) {
-        stats.total3Hz++;
-        if (stats.total3Hz % 30 === 0) {
-          console.log(`[3Hz] #${stats.total3Hz} | 经度: ${message.basic_data.lng?.toFixed(6)} | 纬度: ${message.basic_data.lat?.toFixed(6)} | 高度: ${message.basic_data.relative_height?.toFixed(1)}m | 速度: ${message.basic_data.ground_speed?.toFixed(1)}m/s`);
+        stats.total2Hz++;
+        if (stats.total2Hz % 20 === 0) {
+          console.log(`[2Hz] #${stats.total2Hz} | 经度: ${message.basic_data.lng?.toFixed(6)} | 纬度: ${message.basic_data.lat?.toFixed(6)} | 高度: ${message.basic_data.relative_height?.toFixed(1)}m | 速度: ${message.basic_data.ground_speed?.toFixed(1)}m/s`);
         }
       }
       // 1Hz数据: perception + battery_system
@@ -75,7 +81,7 @@ ws.on('message', (data) => {
           console.log(`[1Hz]  #${stats.total1Hz} | 电量1: ${message.battery_system.battery1?.soc}% | 电量2: ${message.battery_system.battery2?.soc}% | 避障: ${message.perception.obstacle_avoidance?.enabled}`);
         }
       }
-      // 1/30Hz数据: self_check
+      // 认证后的一次性自检数据
       else if (message.self_check) {
         stats.totalSelfCheck++;
         console.log(`[自检] #${stats.totalSelfCheck} | 状态: ${message.self_check.overall} | 动力: ${message.self_check.items.power_system} | 航电: ${message.self_check.items.avionics_system}`);
@@ -102,9 +108,9 @@ function printStats() {
   const duration = (Date.now() - stats.startTime) / 1000;
   console.log('\n=== 统计信息 ===');
   console.log(`运行时间: ${duration.toFixed(1)}秒`);
-  console.log(`3Hz数据: ${stats.total3Hz}条 (平均${(stats.total3Hz / duration).toFixed(1)}Hz)`);
+  console.log(`2Hz数据: ${stats.total2Hz}条 (平均${(stats.total2Hz / duration).toFixed(1)}Hz)`);
   console.log(`1Hz数据: ${stats.total1Hz}条 (平均${(stats.total1Hz / duration).toFixed(1)}Hz)`);
-  console.log(`自检数据: ${stats.totalSelfCheck}条 (平均${(stats.totalSelfCheck / duration * 60).toFixed(2)}/分钟)`);
+  console.log(`自检数据: ${stats.totalSelfCheck}条`);
 }
 
 /**
@@ -137,7 +143,7 @@ function testCommands() {
 
   setTimeout(() => {
     // 5. 手动控制
-    sendCommand('droneControl', { x: 2, y: 0, h: 0.5, w: 10 });
+    sendCommand('droneControl', { x: 2, y: 0, h: 0.5, w: 1.5 });
   }, 7000);
 
   setTimeout(() => {
@@ -161,19 +167,31 @@ function testCommands() {
   }, 15000);
 
   setTimeout(() => {
-    // 10. 测试验签
-    const verifyMessage = {
-      action: 'verify',
-      source: CONFIG.SOURCE,
-      cert: '-----BEGIN CERTIFICATE-----\nMIIDETCCAfmgAwIBAgIGAZ5IenzuMA0GCSqGSIb3DQEBCwUAMDUxFTATBgNVBAMM\n-----END CERTIFICATE-----'
-    };
-    console.log('\n发送验签请求');
-    ws.send(JSON.stringify(verifyMessage));
+    // 10. 测试新增的飞行与载荷控制项
+    sendCommand('obstacleAvoidance', { enabled: 1, stop: 2 });
   }, 17000);
 
   setTimeout(() => {
-    console.log('\n--- 测试完成，继续接收遥测数据 ---\n');
+    sendCommand('setCustomBatteryAlarm', { criticallyLowBattery: 15, lowBattery: 20 });
   }, 19000);
+
+  setTimeout(() => {
+    sendCommand('ledLight', { enabled: 0 });
+  }, 21000);
+
+  setTimeout(() => {
+    sendCommand('gimbalControl', { pitch: -45, yaw: 45, pitchRate: 20, yawRate: 20, flags: 16, model: 'SG-2100' });
+  }, 23000);
+}
+
+function sendVerifyRequest() {
+  const verifyMessage = {
+    action: 'verify',
+    source: CONFIG.SOURCE,
+    cert: '-----BEGIN CERTIFICATE-----\nMIIDETCCAfmgAwIBAgIGAZ5IenzuMA0GCSqGSIb3DQEBCwUAMDUxFTATBgNVBAMM\n-----END CERTIFICATE-----'
+  };
+  console.log('发送验签请求');
+  ws.send(JSON.stringify(verifyMessage));
 }
 
 /**
@@ -184,6 +202,7 @@ function sendCommand(method, data) {
     action: 'command',
     source: CONFIG.SOURCE,
     sn: CONFIG.DRONE_SN,
+    devicetype: 'app',
     tid: uuidv4(),
     bid: bid,
     method,

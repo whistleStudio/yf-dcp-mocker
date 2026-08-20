@@ -1,6 +1,6 @@
 # 无人机地面站WebSocket服务端
 
-根据底软对接文档实现的Node.js WebSocket服务端，支持所有文档中定义的命令和遥测数据。
+根据《地面站—机载0812》实现的 Node.js WebSocket 服务端，模拟无人机控制、遥测、负载与文件服务。
 
 ## 功能特性
 
@@ -29,10 +29,16 @@
 - **routeFly**: 航线飞行
 - **continueFly**: 断点续飞
 - **waypointJump**: 航点跳转
-- **smartFlight**: 智能飞行进入/退出
+- **smartFlight**: 保留的旧版智能飞行兼容指令
+- **setCustomBatteryAlarm**: 设置严重低电量与低电量告警阈值
+- **setFlightLimits**: 设置返航、限高、限远和起飞限制
+- **obstacleAvoidance**: 设置避障开关与刹停策略
+- **setAdvancedLimits**: 设置失联、返航点和摇杆模式
+- **takePhoto**、**startVideo**、**endVideo**: 相机拍照和录像控制
+- **gimbalControl**、**cameraControl**、**ledLight**: 云台、相机与下视 LED 控制
 
 ### 遥测数据
-认证成功后自动发送新版本遥测数据，包含：
+认证成功后自动发送遥测数据；控制命令还必须完成 `verify` 证书验签。遥测包括：
 - **basic_data**: 基础位姿数据
 - **perception**: 感知数据（避障、仿地、视觉降落等）
 - **position_attitude**: 位姿信息
@@ -43,8 +49,12 @@
 - **network_status**: 网络状态
 - **hall_sensors**: 霍尔传感器状态
 - **flight_status**: 飞行状态
+- **self_check**: 认证后发送一次的自检结果
+- **load**: 认证后发送一次的最多 4 个挂载设备清单
 
 其中 `basic_data` 的角度字段范围如下：`heading` 为 0-360 度（360 度与 0 度等价，实际输出为 `[0, 360)`），`yaw`、`pitch`、`roll` 均为 -180 到 180 度。
+
+`bid` 表示一次飞行任务：服务在每次起飞开始时生成新的 UUID，并在起飞、飞行和降落阶段保持不变；下一次起飞时才会更新。
 
 ## 安装
 
@@ -58,9 +68,17 @@ npm install
 # 开发模式（自动重启）
 npm run dev
 
+# 以飞行状态启动
+npm run dev -- --initial-state=airborne
+
+# 以着陆状态启动（默认）
+npm run dev -- --initial-state=landed
+
 # 生产模式
 npm start
 ```
+
+初始状态参数也支持 `--state` 与 `--flight-state` 别名；可选值为 `airborne`（飞行中）和 `landed`（已着陆）。
 
 服务端默认监听端口：`8081`
 
@@ -68,15 +86,16 @@ npm start
 
 启动服务后，同时提供 WebDAV 文件服务：
 
-- 地址：`http://localhost:1900/`
-- 文件根目录：`ftp-data`（与 FTP 服务共用）
-- `admin` / `admin123`：读写权限
-- `viewer` / `viewer123`：读写权限
+- 航线：`http://localhost:1900/plan`
+- 媒体：`http://localhost:1900/ssd`
+- 用户名 / 密码：`admin` / `admin123`（两个路径均为读写权限）
+- 文件目录：`ftp-data/plan` 与 `ftp-data/ssd`；媒体日期目录直接位于 `ssd` 下，不使用 `media` 目录
 
 可在 Windows 文件资源管理器、RaiDrive、Cyberduck 等支持 WebDAV 的客户端中添加上述地址。也可使用 curl 验证：
 
 ```bash
-curl -u admin:admin123 -X PROPFIND -H "Depth: 1" http://localhost:1900/
+curl -u admin:admin123 -X PROPFIND -H "Depth: 1" http://localhost:1900/plan
+curl -u admin:admin123 -X PROPFIND -H "Depth: 1" http://localhost:1900/ssd
 ```
 
 ## 测试
@@ -196,7 +215,10 @@ const CONFIG = {
   WS_PORT: 8081,                    // WebSocket端口
   AUTH_USERNAME: 'rkws',            // 认证用户名
   AUTH_PASSWORD: 'qwer!@#$',        // 认证密码
-  TELEMETRY_INTERVAL: 500,          // 遥测数据发送间隔(ms)
+  FREQ_2HZ: 500,                    // 基础数据与飞行状态，2Hz
+  FREQ_1HZ: 1000,                   // 电池与感知数据，1Hz
+  SIMULATED_LANDING_INTERVAL: 300000, // 飞行中的周期性模拟降落间隔（5分钟）
+  SIMULATED_TAKEOFF_DELAY: 10000,   // 模拟降落后自动起飞等待时间（10秒）
   DRONE_SN: '1F00223233510B34373435' // 无人机序列号
 };
 ```
@@ -209,11 +231,11 @@ const CONFIG = {
   |--- auth 认证请求 ------------->|
   |<-- auth 认证回复 --------------|
   |                                |
-  |--- verify 验签请求 ----------->|
-  |<-- verify 验签回复 ------------|
+  |<-- telemetry 自检与负载信息 ----| (认证后各发送一次)
+  |<-- telemetry 遥测数据 ---------| (2Hz / 1Hz 自动推送)
   |                                |
-  |<-- telemetry 遥测数据 ---------| (自动推送)
-  |<-- telemetry 遥测数据 ---------|
+  |--- verify 证书验签请求 -------->|
+  |<-- verify 验签回复 -------------|
   |                                |
   |--- command 命令 -------------->|
   |<-- command_reply 命令回复 -----|

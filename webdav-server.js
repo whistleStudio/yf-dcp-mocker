@@ -32,6 +32,7 @@ class SimpleWebDavServer {
     this.port = options.port || 1900;
     this.root = path.resolve(options.root || path.join(__dirname, "ftp-data"));
     this.users = options.users || {};
+    this.allowedRoots = options.allowedRoots || null;
     this.server = null;
   }
 
@@ -116,6 +117,15 @@ class SimpleWebDavServer {
     return filePath;
   }
 
+  ensureAllowedPath(pathname) {
+    if (!this.allowedRoots) return;
+    const topLevelPath = pathname.replace(/^\/+|\/+$/g, "").split("/")[0];
+    if (!topLevelPath || this.allowedRoots.includes(topLevelPath)) return;
+    const error = new Error("Resource not found");
+    error.statusCode = 404;
+    throw error;
+  }
+
   requireWritable(user, response) {
     if (!user.readOnly) return true;
     this.sendStatus(response, 403, "This account has read-only access");
@@ -127,6 +137,7 @@ class SimpleWebDavServer {
     if (!user) return;
     const method = request.method.toUpperCase();
     const pathname = this.getPathname(request);
+    this.ensureAllowedPath(pathname);
     const filePath = this.resolvePath(pathname);
     console.log(`[WebDAV] ${user.username} ${method} ${pathname}`);
 
@@ -183,7 +194,10 @@ class SimpleWebDavServer {
     }
     const responses = [this.propResponse(pathname, stat)];
     if (stat.isDirectory() && (request.headers.depth || "infinity").toLowerCase() !== "0") {
-      const children = await fs.promises.readdir(filePath, { withFileTypes: true });
+      let children = await fs.promises.readdir(filePath, { withFileTypes: true });
+      if (pathname === "/" && this.allowedRoots) {
+        children = children.filter((child) => this.allowedRoots.includes(child.name));
+      }
       for (const child of children) {
         const childStat = await fs.promises.stat(path.join(filePath, child.name));
         const prefix = pathname.endsWith("/") ? pathname : `${pathname}/`;
