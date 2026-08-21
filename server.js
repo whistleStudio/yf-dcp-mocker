@@ -1,6 +1,6 @@
 /**
  * 无人机地面站WebSocket服务端
- * 根据地面站—机载0812.doc实现
+ * 根据地面站—机载0820遥测.doc实现
  * 2Hz(基础+飞行状态) 与 1Hz(电池、感知)；认证后发送自检和负载信息。
  */
 
@@ -136,6 +136,8 @@ const droneState = {
   // 协议中时间单位均为秒
   remainingFlightTime: 1080,
   remainingFlightSoc: 87,
+  flightTime: 0,
+  flightDistance: 0,
   criticallyLowBattery: 15,
   lowBattery: 20,
   landedState: INITIAL_IS_AIRBORNE ? 1 : 0, // 0-着陆，1-空中，2-正在着陆，3-正在起飞
@@ -184,6 +186,7 @@ const droneState = {
   },
   obstacleStopStrategy: 2,
   recordingCameras: new Set(),
+  recordingStartedAt: null,
   cameraControl: {
     sensorId: 0,
     focusDir: 0,
@@ -366,6 +369,8 @@ function updateDronePosition() {
     0,
     parseFloat((droneState.battery1_soc - 0.5).toFixed(1)),
   );
+  droneState.flightTime += elapsedSeconds;
+  droneState.flightDistance += droneState.groundSpeed * elapsedSeconds;
 }
 
 /**
@@ -417,7 +422,7 @@ function generate2HzData() {
 }
 
 /**
- * 1Hz数据: 电池、感知数据
+ * 1Hz数据: 感知、系统状态、飞行信息与云台信息
  */
 function generate1HzData() {
   return {
@@ -510,8 +515,10 @@ function generate1HzData() {
       },
       humidity: 65.8,
       cpu_usage: parseFloat((45.2 + Math.random() * 10).toFixed(1)),
-      emmc_usage: 68.5,
-      ssd_usage: 32,
+      emmc_used_gb: 68.5,
+      emmc_free_gb: 32,
+      ssd_used_gb: 30,
+      ssd_free_gb: 40,
       motors: [
         {
           id: 1,
@@ -636,17 +643,28 @@ function generate1HzData() {
       hall1_state: false,
       hall2_state: true,
     },
-    remaining_flight_time: parseFloat(
-      droneState.remainingFlightTime.toFixed(1),
-    ),
-    remaining_flight_soc: droneState.remainingFlightSoc,
-    criticallyLowBattery: droneState.criticallyLowBattery,
-    lowBattery: droneState.lowBattery,
+    flight_info: {
+      remaining_flight_time: parseFloat(
+        droneState.remainingFlightTime.toFixed(1),
+      ),
+      remaining_flight_soc: droneState.remainingFlightSoc,
+      criticallyLowBattery: droneState.criticallyLowBattery,
+      lowBattery: droneState.lowBattery,
+      flight_time: parseFloat(droneState.flightTime.toFixed(1)),
+      flight_distance: parseFloat(droneState.flightDistance.toFixed(1)),
+    },
     gimbal_angle: {
       los_pitch: droneState.losPitch,
       gimbal_pitch: parseFloat(droneState.gimbalPitch.toFixed(5)),
       gimbal_yaw: parseFloat(droneState.gimbalYaw.toFixed(5)),
       gimbal_roll: parseFloat(droneState.gimbalRoll.toFixed(5)),
+    },
+    gimbal_info: {
+      record_status: droneState.recordingCameras.size > 0 ? 1 : 0,
+      record_duration: droneState.recordingStartedAt
+        ? Date.now() - droneState.recordingStartedAt
+        : 0,
+      laser_distance: 0,
     },
   };
 }
@@ -1461,6 +1479,7 @@ function handleStartVideo(ws, tid, bid, data = {}) {
     return;
   }
   droneState.recordingCameras.add(camera);
+  droneState.recordingStartedAt ||= Date.now();
   sendCommandReply(ws, tid, bid, "startVideo", 0, "录像已开始");
 }
 
@@ -1471,6 +1490,9 @@ function handleEndVideo(ws, tid, bid, data = {}) {
     return;
   }
   droneState.recordingCameras.delete(camera);
+  if (droneState.recordingCameras.size === 0) {
+    droneState.recordingStartedAt = null;
+  }
   sendCommandReply(ws, tid, bid, "endVideo", 0, "录像已结束");
 }
 

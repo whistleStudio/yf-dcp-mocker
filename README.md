@@ -1,6 +1,6 @@
 # 无人机地面站WebSocket服务端
 
-根据《地面站—机载0812》实现的 Node.js WebSocket 服务端，模拟无人机控制、遥测、负载与文件服务。
+根据《地面站—机载0820遥测》实现的 Node.js WebSocket 服务端，模拟无人机控制、遥测、负载与文件服务。
 
 ## 功能特性
 
@@ -49,6 +49,8 @@
 - **network_status**: 网络状态
 - **hall_sensors**: 霍尔传感器状态
 - **flight_status**: 飞行状态
+- **flight_info**: 飞行时长、距离、剩余时间和电量告警
+- **gimbal_angle**、**gimbal_info**: 云台姿态和录像/激光测距信息
 - **self_check**: 认证后发送一次的自检结果
 - **load**: 认证后发送一次的最多 4 个挂载设备清单
 
@@ -185,26 +187,46 @@ ws://localhost:8081
     "pitch": 0,
     "roll": 0
   },
+  "flight_status": { ... }
+}
+```
+
+2Hz 消息包含 `basic_data` 和 `flight_status`；1Hz 消息包含下列字段：
+
+```json
+{
+  "method": "realtimeData",
   "perception": { ... },
   "position_attitude": { ... },
   "communication": { ... },
-  "avionics": { ... },
+  "avionics": {
+    "emmc_used_gb": 68.5,
+    "emmc_free_gb": 32,
+    "ssd_used_gb": 30,
+    "ssd_free_gb": 40
+  },
   "battery_system": { ... },
   "power_modules": { ... },
   "network_status": { ... },
   "hall_sensors": { ... },
-  "flight_status": {
+  "flight_info": {
     "remaining_flight_time": 45,
-    "landed_state": 1,
-    "mode_num": 2,
-    "lock": true,
-    "serial_number": "1581F6M1234567",
-    "firmware_version": "v01.02.03",
-    "board_type": "K9飞控",
-    "current_waypoint_seq": 0
+    "remaining_flight_soc": 87,
+    "criticallyLowBattery": 15,
+    "lowBattery": 20,
+    "flight_time": 120,
+    "flight_distance": 1500
+  },
+  "gimbal_angle": { ... },
+  "gimbal_info": {
+    "record_status": 0,
+    "record_duration": 0,
+    "laser_distance": 0
   }
 }
 ```
+
+`avionics` 的存储容量均以 GB 为单位；`flight_info.remaining_flight_time`、`flight_info.flight_time` 以秒计，`flight_info.flight_distance` 以米计；`gimbal_info.record_duration` 以毫秒计。
 
 ## 配置
 

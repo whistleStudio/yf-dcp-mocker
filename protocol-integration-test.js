@@ -1,5 +1,5 @@
 /**
- * 验证《地面站—机载0812》要求的 WebSocket 握手、遥测和控制消息。
+ * 验证《地面站—机载0820遥测》要求的 WebSocket 握手、遥测和控制消息。
  */
 
 const { spawn } = require("child_process");
@@ -161,9 +161,18 @@ function startClient() {
       if (
         message.perception &&
         message.position_attitude?.start_position &&
-        Number.isFinite(message.remaining_flight_time) &&
-        Object.hasOwn(message, "criticallyLowBattery") &&
-        Object.hasOwn(message, "lowBattery")
+        Number.isFinite(message.avionics?.emmc_used_gb) &&
+        Number.isFinite(message.avionics?.emmc_free_gb) &&
+        Number.isFinite(message.avionics?.ssd_used_gb) &&
+        Number.isFinite(message.avionics?.ssd_free_gb) &&
+        Number.isFinite(message.flight_info?.remaining_flight_time) &&
+        Object.hasOwn(message.flight_info || {}, "criticallyLowBattery") &&
+        Object.hasOwn(message.flight_info || {}, "lowBattery") &&
+        Number.isFinite(message.flight_info?.flight_time) &&
+        Number.isFinite(message.flight_info?.flight_distance) &&
+        Number.isInteger(message.gimbal_info?.record_status) &&
+        Number.isFinite(message.gimbal_info?.record_duration) &&
+        Number.isFinite(message.gimbal_info?.laser_distance)
       ) {
         expected.delete("detail");
       }
